@@ -7,10 +7,13 @@ Endpoints
 * ``GET  /api/v1/archives/{run_id}`` — archive metadata.
 * ``GET  /api/v1/archives/{run_id}/minutes`` — reconstructed values and in-band
   periods for a minute range of one run.
+* ``POST /api/v1/archives/{run_id}/review`` — read-only check of an ordered
+  holding-stage recipe against one archived run.
 * ``GET  /health`` — database reachability.
 
 A failed or rejected write never affects archives that are already stored;
 queries always read the same stored archive and derive everything from it.
+Reviews are strictly read-only and never modify an archive.
 """
 
 from __future__ import annotations
@@ -36,6 +39,9 @@ from .models import (
     ErrorResponse,
     HealthResponse,
     MinuteSample,
+    ReviewRequest,
+    ReviewResponse,
+    ReviewStageWindow,
 )
 from .planner import (
     PlanError,
@@ -43,6 +49,14 @@ from .planner import (
     in_band_intervals,
     plan_archive,
     reconstruct_spans,
+)
+from .review import (
+    CONFIRMED,
+    INSUFFICIENT_EVIDENCE,
+    StageSpec,
+    VERDICT_TEXT,
+    infer_value_ranges,
+    review_run,
 )
 
 
@@ -439,6 +453,92 @@ def create_app() -> FastAPI:
             minutes=minutes,
             in_band_intervals=intervals,
             missing_minutes=missing_minutes,
+            payload_sha256=archive.payload_sha256,
+        )
+
+    @api.post(
+        "/archives/{run_id}/review",
+        response_model=ReviewResponse,
+        responses={
+            404: {"model": ErrorResponse, "description": "Run not archived"},
+            422: {"model": ErrorResponse, "description": "Invalid review request"},
+        },
+        tags=["review"],
+        summary="Confirm an ordered holding-stage recipe against one archived run",
+        description=(
+            "Read-only check. Each stage must occupy exactly its hold_minutes "
+            "of consecutive measured minutes, stages keep their given order, "
+            "do not overlap, and the gap between adjacent stages may not "
+            "exceed max_gap_minutes (missing minutes still count in a gap). "
+            "Each minute's original value is bounded by the archive's "
+            "reconstruction error, the API's accepted temperature range and "
+            "its original band classification; retained minutes keep their "
+            "stored reading. Verdicts: confirmed (确认达标) when a window "
+            "sequence exists with every minute's whole range inside its band, "
+            "insufficient_evidence (证据不足) when a sequence exists only "
+            "with every minute's range intersecting its band, not_met (不达标) "
+            "when no sequence exists at all."
+        ),
+    )
+    def review_archive(
+        run_id: Annotated[str, Path(min_length=1, max_length=64)],
+        payload: ReviewRequest,
+    ) -> ReviewResponse:
+        archive = _load_archive(db.ArchiveStore(_store_path()), run_id)
+        values = _archive_values(archive)
+        anchors = dict(archive.retained_points)
+        ranges = infer_value_ranges(
+            values,
+            anchors,
+            tolerance=archive.tolerance_tenths_c,
+            band_low=archive.band_low_tenths_c,
+            band_high=archive.band_high_tenths_c,
+        )
+        outcome = review_run(
+            ranges,
+            [
+                StageSpec(
+                    band_low_tenths_c=stage.band_low_tenths_c,
+                    band_high_tenths_c=stage.band_high_tenths_c,
+                    hold_minutes=stage.hold_minutes,
+                )
+                for stage in payload.stages
+            ],
+            payload.max_gap_minutes,
+        )
+        if outcome.verdict in (CONFIRMED, INSUFFICIENT_EVIDENCE):
+            windows = [
+                ReviewStageWindow(
+                    stage_index=window.stage_index,
+                    start_minute_utc=archive.start_minute_utc + window.start_offset,
+                    end_minute_utc=(
+                        archive.start_minute_utc
+                        + window.start_offset
+                        + window.hold_minutes
+                        - 1
+                    ),
+                    hold_minutes=window.hold_minutes,
+                    band_low_tenths_c=payload.stages[
+                        window.stage_index - 1
+                    ].band_low_tenths_c,
+                    band_high_tenths_c=payload.stages[
+                        window.stage_index - 1
+                    ].band_high_tenths_c,
+                )
+                for window in outcome.windows
+            ]
+        else:
+            windows = []
+        return ReviewResponse(
+            run_id=archive.run_id,
+            verdict=outcome.verdict,
+            verdict_text=VERDICT_TEXT[outcome.verdict],
+            reason=outcome.reason,
+            max_gap_minutes=payload.max_gap_minutes,
+            stages=payload.stages,
+            stage_windows=windows,
+            failed_stage_index=outcome.failed_stage_index,
+            tolerance_tenths_c=archive.tolerance_tenths_c,
             payload_sha256=archive.payload_sha256,
         )
 

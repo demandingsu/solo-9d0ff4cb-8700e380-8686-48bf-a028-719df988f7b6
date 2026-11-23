@@ -31,6 +31,7 @@ FURNACE_DB_PATH=./data/furnace_archive.sqlite3 \
 | `GET` | `/api/v1/archives` | 列出已归档炉次（最新在前） |
 | `GET` | `/api/v1/archives/{run_id}` | 归档元数据与留点数 |
 | `GET` | `/api/v1/archives/{run_id}/minutes?start_minute_utc=&end_minute_utc=` | 区间内的复原炉温、缺测分钟、温区内连续时段 |
+| `POST` | `/api/v1/archives/{run_id}/review` | 只读复核：按顺序校验 1～6 个保温阶段，给出达标判定与各段 UTC 起止分钟 |
 | `GET` | `/health` | 数据库可达性 |
 
 ### 入档示例
@@ -66,6 +67,33 @@ curl -s 'http://localhost:8000/api/v1/archives/HT-2026-0042/minutes?start_minute
 区间内的 `in_band_intervals` 返回**所有与查询区间相交**的完整时段，不会被查询边界截断，因此可以直接读出一次保温持续了多久；缺测分钟会打断时段。
 查询区间必须落在该炉次范围内，否则返回 `416`。
 
+### 炉温冷档复核
+
+工艺员用已有炉次验证新配方时，调用 `POST /api/v1/archives/{run_id}/review`。
+请求按**依次执行**的顺序给出 1～6 个保温阶段，每段填写温区上下限（十之一摄氏度，上下限计入）与保温分钟数，再给出相邻阶段之间最多可空出的分钟数：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/archives/HT-2026-0042/review \
+  -H 'Content-Type: application/json' -d '{
+    "stages": [
+      {"band_low_tenths_c": 7800, "band_high_tenths_c": 8200, "hold_minutes": 5},
+      {"band_low_tenths_c": 7950, "band_high_tenths_c": 8050, "hold_minutes": 3}
+    ],
+    "max_gap_minutes": 2
+  }'
+```
+
+复核规则：
+
+1. **原值范围**：留点用原读数（单一值）；其余实测分钟由复原值 `r`、入档时的误差上限、接口允许的温度范围（`-10000..50000`）以及**原温区判定**共同推定原值范围：`[r-tol, r+tol]` 与该分类对应的温区约束取交集，再按接口温度范围裁剪。缺测分钟没有原值。
+2. **阶段窗口**：每段恰取规定时长的**连续实测分钟**；缺测分钟不能计入保温（但缺测分钟计入阶段间隔）。阶段先后顺序固定、互不重叠，相邻阶段之间空出的分钟数不得超过 `max_gap_minutes`。整数分钟：前一阶段结束后的下一分钟起算，间隔 = 后段起点 − 前段终点 − 1。
+3. **判定**：
+   - `confirmed`（确认达标）：能排出一套窗口，且每个分钟的原值范围**全部**落在对应温区内；
+   - `insufficient_evidence`（证据不足）：排不出全落区间的窗口，但能排出每分钟范围与对应温区**相交**的整套窗口；
+   - `not_met`（不达标）：连相交的整套窗口都排不出。
+   - 前两种都会在 `stage_windows[]` 给出各阶段以 UTC 分钟表示的**含首尾**起止分钟。
+4. **只读**：复核不写入、不修改任何归档；冷档不存在返回 `404`，归档校验失败返回 `500`，请求校验失败返回 `422`。
+
 ## 压缩规则与保证
 
 1. **每段连续实测数据保留首尾**：缺测会把炉次切成若干连续实测段，每段首、尾采样点必须留点。
@@ -88,11 +116,11 @@ curl -s 'http://localhost:8000/api/v1/archives/HT-2026-0042/minutes?start_minute
 | `409` | `run_already_archived` | 炉次已归档，原归档保持不变 |
 | `422` | `no_feasible_plan` | 无可行方案（附 `minimum_retained_points`、`max_retained_points`） |
 | `422` | `invalid_request` / `invalid_range` | 请求校验失败 / 分钟区间颠倒 |
-| `404` | `archive_not_found` | 该炉次无归档 |
+| `404` | `archive_not_found` | 该炉次无归档（查询与复核均适用） |
 | `416` | `range_outside_run` | 查询区间超出该炉次范围 |
 | `503` | `archive_write_failed` | 写入失败（`retryable` 指示可否重试） |
 | `503` | `archive_unavailable` | 数据库不可达/不可打开 |
-| `500` | `archive_corrupt` | 归档校验失败 |
+| `500` | `archive_corrupt` | 归档校验失败（查询与复核均适用） |
 
 ## 测试
 
@@ -101,15 +129,16 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-测试覆盖：规划器与穷举最优解对比、误差/温区/首尾留点约束、缺测不桥接、上限剔除原因、入库只存压缩档、重复炉次、写入失败后旧归档仍可查、篡改检测、区间与缺测标记。
+测试覆盖：规划器与穷举最优解对比、误差/温区/首尾留点约束、缺测不桥接、上限剔除原因、入库只存压缩档、重复炉次、写入失败后旧归档仍可查、篡改检测、区间与缺测标记；复核的原值范围推定、阶段顺序/间隔/不重叠、缺测不计入保温、三种判定、只读性、错误路径。
 
 ## 结构
 
 ```
 app/planner.py   压缩规划（精确最小留点）、复原、温区时段
+app/review.py    只读复核：原值范围推定与阶段窗口判定
 app/db.py        SQLite 冷档存储与完整性校验
 app/models.py    请求/响应模型与字段校验
 app/main.py      FastAPI 路由与统一错误响应
-tests/           规划器与 API 测试
+tests/           规划器、复核与 API 测试
 Dockerfile, docker-compose.yml
 ```
